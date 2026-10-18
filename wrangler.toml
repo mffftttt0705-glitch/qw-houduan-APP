@@ -1,0 +1,6 @@
+name = "qw-houduan-app"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+workers_dev = true
+
+# 不需要静态资源目录，这是纯 API Worker
