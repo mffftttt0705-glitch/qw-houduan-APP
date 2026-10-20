@@ -36,7 +36,7 @@ const MEM = {
   dispatch_orders: [], dispatch_templates: [],
   shops: [], posts: [], post_categories: [], gifts: [], stickers: [],
   recharges: [], withdrawals: [], icons: [], exchange_rules: [], checkin_rewards: [],
-  hall_categories: [], theme: null, ai_settings: { enabled: false }, banned_words: [],
+  hall_categories: [], theme: null, ai_settings: { enabled: false, model: '', knowledge: '' }, banned_words: [], auto_replies: [],
   seeded: false
 };
 function memAll(t, fn) { let r = MEM[t] || []; return fn ? r.filter(fn) : r; }
@@ -381,13 +381,6 @@ export async function onRequest(context) {
         return jsonResponse(u.results || []);
       }
       return jsonResponse(memAll('users', u => u.role === 'handler').map(u => ({ id: u.id, username: u.username, score: u.diamond })));
-    }
-    if (path === '/api/hall/orders' && method === 'GET') {
-      if (hasDB(env)) {
-        const r = await queryDB(env, 'SELECT * FROM dispatch_orders WHERE status=\'open\' ORDER BY created_at DESC LIMIT 50');
-        return jsonResponse(r.results || []);
-      }
-      return jsonResponse(memAll('dispatch_orders', r => r.status === 'open').reverse().slice(0, 50));
     }
     if (path === '/api/orders/buy' && method === 'POST') {
       const uid = verifyUserId(auth);
@@ -878,6 +871,277 @@ export async function onRequest(context) {
       } catch (e) {
         return errorResponse('图库列表失败: ' + (e && e.message ? e.message : e), 500);
       }
+    }
+
+
+
+    // ===== 管理端完整 CRUD（对齐 Web 控制台）=====
+    if (path === '/api/admin/deduct' && method === 'POST') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const uid = String(body.user_id || body.id || '');
+      const amount = parseFloat(body.amount) || 0;
+      if (!uid || amount <= 0) return errorResponse('参数错误');
+      const u = await getUserById(env, uid);
+      if (!u) return errorResponse('用户不存在', 404);
+      const cur = parseFloat(u.diamond) || 0;
+      if (amount > cur) return errorResponse('超过余额');
+      const next = cur - amount;
+      if (hasDB(env)) await runDB(env, 'UPDATE users SET diamond=? WHERE id=?', [next, uid]);
+      else memUpdate('users', uid, { diamond: next });
+      return jsonResponse({ success: true, diamond: next });
+    }
+    if (path.startsWith('/api/admin/recharges/') && method === 'POST') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const parts = path.replace('/api/admin/recharges/', '').split('/');
+      const id = parts[0];
+      const action = parts[1] || body.action || '';
+      if (hasDB(env)) {
+        const r = await queryDB(env, 'SELECT * FROM recharges WHERE id=?', [id]);
+        const row = r.results && r.results[0];
+        if (!row) return errorResponse('记录不存在', 404);
+        if (action === 'approve') {
+          await runDB(env, "UPDATE recharges SET status='approved' WHERE id=?", [id]);
+          const u = await getUserById(env, row.user_id);
+          if (u) {
+            const d = (parseFloat(u.diamond)||0) + (parseFloat(row.amount)||0);
+            await runDB(env, 'UPDATE users SET diamond=? WHERE id=?', [d, row.user_id]);
+          }
+        } else if (action === 'reject') {
+          await runDB(env, "UPDATE recharges SET status='rejected' WHERE id=?", [id]);
+        } else if (action === 'delete') {
+          await runDB(env, 'DELETE FROM recharges WHERE id=?', [id]);
+        }
+      } else {
+        const row = memGet('recharges', id);
+        if (!row) return errorResponse('记录不存在', 404);
+        if (action === 'approve') {
+          memUpdate('recharges', id, { status: 'approved' });
+          const u = memGet('users', row.user_id);
+          if (u) memUpdate('users', row.user_id, { diamond: (parseFloat(u.diamond)||0) + (parseFloat(row.amount)||0) });
+        } else if (action === 'reject') memUpdate('recharges', id, { status: 'rejected' });
+        else if (action === 'delete') memDelete('recharges', id);
+      }
+      return jsonResponse({ success: true });
+    }
+    if (path === '/api/admin/banners' && method === 'POST') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const id = generateId(), now = new Date().toISOString();
+      const row = { id, title: body.title || '', image: body.image || body.url || '', sort_order: parseInt(body.sort_order,10)||0, enabled: 1, created_at: now };
+      if (hasDB(env)) await runDB(env, 'INSERT INTO banners (id,title,image,sort_order,enabled,created_at) VALUES (?,?,?,?,?,?)', [id, row.title, row.image, row.sort_order, 1, now]);
+      else memInsert('banners', row);
+      return jsonResponse({ success: true, id });
+    }
+    if (path.startsWith('/api/admin/banners/') && (method === 'DELETE' || method === 'POST')) {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const id = path.replace('/api/admin/banners/', '').split('/')[0];
+      if (hasDB(env)) await runDB(env, 'DELETE FROM banners WHERE id=?', [id]);
+      else memDelete('banners', id);
+      return jsonResponse({ success: true });
+    }
+    if (path === '/api/admin/icons' && method === 'POST') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const key_name = body.key_name || body.key || '';
+      const url = body.url || '';
+      if (!key_name) return errorResponse('缺少 key_name');
+      const id = key_name;
+      if (hasDB(env)) {
+        await runDB(env, 'DELETE FROM icons WHERE key_name=?', [key_name]);
+        await runDB(env, 'INSERT INTO icons (id,key_name,url) VALUES (?,?,?)', [id, key_name, url]);
+      } else {
+        MEM.icons = (MEM.icons || []).filter(x => x.key_name !== key_name);
+        memInsert('icons', { id, key_name, url });
+      }
+      return jsonResponse({ success: true });
+    }
+    if (path.startsWith('/api/admin/icons/') && (method === 'DELETE' || method === 'POST')) {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const key = decodeURIComponent(path.replace('/api/admin/icons/', '').split('/')[0]);
+      if (hasDB(env)) await runDB(env, 'DELETE FROM icons WHERE key_name=? OR id=?', [key, key]);
+      else MEM.icons = (MEM.icons || []).filter(x => x.key_name !== key && x.id !== key);
+      return jsonResponse({ success: true });
+    }
+    if (path === '/api/admin/gifts' && method === 'POST') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const id = generateId();
+      const row = { id, name: body.name || '', price: parseFloat(body.price)||0, image: body.image || body.url || '', enabled: 1 };
+      if (hasDB(env)) await runDB(env, 'INSERT INTO gifts (id,name,price,image,enabled) VALUES (?,?,?,?,1)', [id, row.name, row.price, row.image]);
+      else memInsert('gifts', row);
+      return jsonResponse({ success: true, id });
+    }
+    if (path.startsWith('/api/admin/gifts/') && (method === 'DELETE' || method === 'POST')) {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const id = path.replace('/api/admin/gifts/', '').split('/')[0];
+      if (hasDB(env)) await runDB(env, 'DELETE FROM gifts WHERE id=?', [id]);
+      else memDelete('gifts', id);
+      return jsonResponse({ success: true });
+    }
+    if (path === '/api/ai/settings' && method === 'POST') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      MEM.ai_settings = {
+        enabled: !!body.enabled,
+        model: body.model || '',
+        knowledge: body.knowledge || '',
+        ...(body || {})
+      };
+      return jsonResponse({ success: true, settings: MEM.ai_settings });
+    }
+    if (path === '/api/auto-replies' && method === 'GET') {
+      return jsonResponse(MEM.auto_replies || []);
+    }
+    if (path === '/api/auto-replies' && method === 'POST') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const id = generateId();
+      const row = { id, keywords: body.keywords || '', reply: body.reply || body.content || '' };
+      if (!MEM.auto_replies) MEM.auto_replies = [];
+      MEM.auto_replies.push(row);
+      return jsonResponse({ success: true, id });
+    }
+    if (path.startsWith('/api/auto-replies/') && (method === 'DELETE' || method === 'POST')) {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const id = path.replace('/api/auto-replies/', '').split('/')[0];
+      MEM.auto_replies = (MEM.auto_replies || []).filter(x => x.id !== id);
+      return jsonResponse({ success: true });
+    }
+    if (path === '/api/admin/stickers' && method === 'POST') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const id = generateId(), now = new Date().toISOString();
+      const row = { id, name: body.name || 'sticker', url: body.url || '', is_public: 1, created_at: now };
+      if (hasDB(env)) await runDB(env, 'INSERT INTO stickers (id,name,url,is_public,created_at) VALUES (?,?,?,1,?)', [id, row.name, row.url, now]);
+      else memInsert('stickers', row);
+      return jsonResponse({ success: true, id });
+    }
+    if (path.startsWith('/api/admin/stickers/') && (method === 'DELETE' || method === 'POST')) {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const id = path.replace('/api/admin/stickers/', '').split('/')[0];
+      if (hasDB(env)) await runDB(env, 'DELETE FROM stickers WHERE id=?', [id]);
+      else memDelete('stickers', id);
+      return jsonResponse({ success: true });
+    }
+    if (path === '/api/admin/checkin-rewards' && method === 'POST') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const day_index = parseInt(body.day_index || body.day, 10) || 1;
+      const id = 'day_' + day_index;
+      const row = { id, day_index, reward: body.reward || body.name || '金币', amount: parseFloat(body.amount)||10, sort_order: parseInt(body.sort_order,10)||0, enabled: body.enabled !== false && body.enabled !== 0 ? 1 : 0 };
+      if (hasDB(env)) {
+        await runDB(env, 'DELETE FROM checkin_rewards WHERE day_index=?', [day_index]);
+        await runDB(env, 'INSERT INTO checkin_rewards (id,day_index,reward,amount) VALUES (?,?,?,?)', [id, day_index, row.reward, row.amount]);
+      } else {
+        MEM.checkin_rewards = (MEM.checkin_rewards || []).filter(x => x.day_index !== day_index);
+        memInsert('checkin_rewards', row);
+      }
+      return jsonResponse({ success: true, id });
+    }
+    if (path.startsWith('/api/admin/checkin-rewards/') && (method === 'DELETE' || method === 'POST')) {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const id = path.replace('/api/admin/checkin-rewards/', '').split('/')[0];
+      if (hasDB(env)) await runDB(env, 'DELETE FROM checkin_rewards WHERE id=? OR day_index=?', [id, parseInt(id,10)||0]);
+      else MEM.checkin_rewards = (MEM.checkin_rewards || []).filter(x => x.id !== id && String(x.day_index) !== id);
+      return jsonResponse({ success: true });
+    }
+    if (path === '/api/admin/exchange-rules' && method === 'POST') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const id = generateId();
+      const row = { id, name: body.name || '', cost: parseInt(body.cost,10)||0, reward: body.reward || body.desc || body.description || '' };
+      if (hasDB(env)) await runDB(env, 'INSERT INTO exchange_rules (id,name,cost,reward) VALUES (?,?,?,?)', [id, row.name, row.cost, row.reward]);
+      else memInsert('exchange_rules', row);
+      return jsonResponse({ success: true, id });
+    }
+    if (path.startsWith('/api/admin/exchange-rules/') && (method === 'DELETE' || method === 'POST')) {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const id = path.replace('/api/admin/exchange-rules/', '').split('/')[0];
+      if (hasDB(env)) await runDB(env, 'DELETE FROM exchange_rules WHERE id=?', [id]);
+      else memDelete('exchange_rules', id);
+      return jsonResponse({ success: true });
+    }
+    if (path === '/api/post-categories' && method === 'POST') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const id = generateId();
+      const row = { id, name: body.name || '', sort_order: parseInt(body.sort_order,10)||0 };
+      if (hasDB(env)) await runDB(env, 'INSERT INTO post_categories (id,name,sort_order) VALUES (?,?,?)', [id, row.name, row.sort_order]);
+      else memInsert('post_categories', row);
+      return jsonResponse({ success: true, id });
+    }
+    if (path.startsWith('/api/post-categories/') && (method === 'DELETE' || method === 'POST')) {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const id = path.replace('/api/post-categories/', '').split('/')[0];
+      if (hasDB(env)) await runDB(env, 'DELETE FROM post_categories WHERE id=?', [id]);
+      else memDelete('post_categories', id);
+      return jsonResponse({ success: true });
+    }
+    if (path.startsWith('/api/posts/') && method === 'DELETE') {
+      const uid = verifyUserId(auth);
+      if (!uid) return errorResponse('请先登录', 401);
+      const id = path.replace('/api/posts/', '').split('/')[0];
+      const isAdmin = await requireAdmin(env, auth);
+      if (hasDB(env)) {
+        const r = await queryDB(env, 'SELECT * FROM posts WHERE id=?', [id]);
+        const post = r.results && r.results[0];
+        if (!post) return errorResponse('不存在', 404);
+        if (!isAdmin && post.user_id !== uid) return errorResponse('无权删除', 403);
+        await runDB(env, 'DELETE FROM posts WHERE id=?', [id]);
+      } else {
+        const post = memGet('posts', id);
+        if (!post) return errorResponse('不存在', 404);
+        if (!isAdmin && post.user_id !== uid) return errorResponse('无权删除', 403);
+        memDelete('posts', id);
+      }
+      return jsonResponse({ success: true });
+    }
+    if (path === '/api/hall/publish-demand' && method === 'POST') {
+      const uid = verifyUserId(auth);
+      if (!uid) return errorResponse('请先登录', 401);
+      const u = await getUserById(env, uid);
+      const id = generateId(), now = new Date().toISOString();
+      const row = {
+        id, title: body.title || '', game_category: body.game_category || body.category || '',
+        price: parseFloat(body.price)||0, quantity: 1, urgency: body.urgency || '普通',
+        detail: body.detail || body.desc || '', remark: body.remark || '', contact: body.contact || '',
+        status: 'open', publisher_id: uid, publisher_name: u ? u.username : '', created_at: now
+      };
+      if (hasDB(env)) {
+        await runDB(env, `INSERT INTO dispatch_orders (id,title,game_category,price,quantity,urgency,detail,remark,contact,status,publisher_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [id, row.title, row.game_category, row.price, 1, row.urgency, row.detail, row.remark, row.contact, 'open', uid, now]);
+      } else memInsert('dispatch_orders', row);
+      return jsonResponse({ success: true, id });
+    }
+    if (path.startsWith('/api/hall/orders/') && method === 'POST') {
+      const uid = verifyUserId(auth);
+      if (!uid) return errorResponse('请先登录', 401);
+      const parts = path.replace('/api/hall/orders/', '').split('/');
+      const id = parts[0];
+      const action = parts[1] || body.action || '';
+      if (action === 'cancel') {
+        if (hasDB(env)) {
+          const r = await queryDB(env, 'SELECT * FROM dispatch_orders WHERE id=?', [id]);
+          const row = r.results && r.results[0];
+          if (!row) return errorResponse('不存在', 404);
+          const isAdmin = await requireAdmin(env, auth);
+          if (!isAdmin && row.publisher_id !== uid) return errorResponse('无权撤销', 403);
+          await runDB(env, "UPDATE dispatch_orders SET status='cancelled' WHERE id=?", [id]);
+        } else {
+          const row = memGet('dispatch_orders', id);
+          if (!row) return errorResponse('不存在', 404);
+          const isAdmin = await requireAdmin(env, auth);
+          if (!isAdmin && row.publisher_id !== uid) return errorResponse('无权撤销', 403);
+          memUpdate('dispatch_orders', id, { status: 'cancelled' });
+        }
+        return jsonResponse({ success: true });
+      }
+      return errorResponse('未知操作');
+    }
+    if (path === '/api/hall/orders' && method === 'GET') {
+      const cat = url.searchParams.get('cat') || '';
+      if (hasDB(env)) {
+        let sql = "SELECT * FROM dispatch_orders WHERE status!='cancelled'";
+        const params = [];
+        if (cat) { sql += ' AND game_category=?'; params.push(cat); }
+        sql += ' ORDER BY created_at DESC LIMIT 100';
+        const r = await queryDB(env, sql, params);
+        return jsonResponse(r.results || []);
+      }
+      let rows = (MEM.dispatch_orders || []).filter(o => o.status !== 'cancelled');
+      if (cat) rows = rows.filter(o => o.game_category === cat);
+      return jsonResponse([...rows].reverse());
     }
 
 
