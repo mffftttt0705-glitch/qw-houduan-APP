@@ -805,10 +805,6 @@ export async function onRequest(context) {
       if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
       return jsonResponse(['users','products','orders','messages','shops','posts','dispatch_orders','banners','announcements']);
     }
-    if (path === '/api/admin/b2/list' && method === 'GET') {
-      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
-      return jsonResponse([]);
-    }
     if (path === '/api/dispatcher/orders' && method === 'GET') {
       if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM dispatch_orders ORDER BY created_at DESC LIMIT 100'); return jsonResponse(r.results || []); }
       return jsonResponse([...(MEM.dispatch_orders || [])].reverse());
@@ -828,6 +824,60 @@ export async function onRequest(context) {
       }
       const c = (MEM.messages || []).filter(m => m.receiver_id === uid).length;
       return jsonResponse({ count: Math.min(c, 99) });
+    }
+
+
+
+    // ===== 图片上传到 B2 / R2（绑定变量名：BUCKET 或 B2）=====
+    if (path === '/api/upload' && method === 'POST') {
+      const uid = verifyUserId(auth);
+      if (!uid) return errorResponse('请先登录', 401);
+      let form;
+      try { form = await request.formData(); } catch (_) {
+        return errorResponse('请使用 multipart/form-data 上传');
+      }
+      const file = form.get('file');
+      if (!file || typeof file === 'string') return errorResponse('请选择文件 file');
+      const bucket = env.BUCKET || env.B2 || env.R2;
+      if (!bucket || typeof bucket.put !== 'function') {
+        return errorResponse('未绑定图库：Pages 绑定 R2/B2，变量名用 BUCKET 或 B2', 500);
+      }
+      const rawName = (file.name || 'image.jpg').replace(/[^\w.\-]+/g, '_');
+      const key = 'uploads/' + Date.now() + '_' + rawName;
+      const contentType = file.type || 'application/octet-stream';
+      await bucket.put(key, file.stream(), { httpMetadata: { contentType } });
+      const publicBase = (env.B2_PUBLIC_URL || env.R2_PUBLIC_URL || env.PUBLIC_FILE_URL || '').replace(/\/$/, '');
+      const url = publicBase ? (publicBase + '/' + key) : key;
+      return jsonResponse({ success: true, url, key, contentType });
+    }
+    if ((path === '/api/user/avatar' || path === '/api/user/banner') && (method === 'POST' || method === 'PUT')) {
+      const uid = verifyUserId(auth);
+      if (!uid) return errorResponse('请先登录', 401);
+      const field = path.endsWith('banner') ? 'banner' : 'avatar';
+      const val = body.avatar_url || body.avatar || body.banner || body.url || '';
+      if (hasDB(env)) {
+        await runDB(env, 'UPDATE users SET ' + field + '=? WHERE id=?', [val, uid]);
+      } else {
+        const patch = {}; patch[field] = val;
+        memUpdate('users', uid, patch);
+      }
+      return jsonResponse({ success: true });
+    }
+    if (path === '/api/admin/b2/list' && method === 'GET') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      const bucket = env.BUCKET || env.B2 || env.R2;
+      if (!bucket || typeof bucket.list !== 'function') return jsonResponse([]);
+      try {
+        const listed = await bucket.list({ limit: 100, prefix: 'uploads/' });
+        const base = (env.B2_PUBLIC_URL || env.R2_PUBLIC_URL || env.PUBLIC_FILE_URL || '').replace(/\/$/, '');
+        const objects = (listed.objects || []).map(o => ({
+          key: o.key, size: o.size, uploaded: o.uploaded,
+          url: base ? (base + '/' + o.key) : o.key
+        }));
+        return jsonResponse(objects);
+      } catch (e) {
+        return errorResponse('图库列表失败: ' + (e && e.message ? e.message : e), 500);
+      }
     }
 
 
