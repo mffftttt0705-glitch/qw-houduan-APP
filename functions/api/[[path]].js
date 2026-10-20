@@ -33,7 +33,11 @@ const MEM = {
   users: [], side_categories: [], sub_categories: [], products: [],
   home_tabs: [], announcements: [], banners: [], quick_links: [], home_sections: [],
   orders: [], messages: [], checkin_records: [], rank_items: [],
-  dispatch_orders: [], dispatch_templates: [], seeded: false
+  dispatch_orders: [], dispatch_templates: [],
+  shops: [], posts: [], post_categories: [], gifts: [], stickers: [],
+  recharges: [], withdrawals: [], icons: [], exchange_rules: [], checkin_rewards: [],
+  hall_categories: [], theme: null, ai_settings: { enabled: false }, banned_words: [],
+  seeded: false
 };
 function memAll(t, fn) { let r = MEM[t] || []; return fn ? r.filter(fn) : r; }
 function memGet(t, id) { return (MEM[t] || []).find(x => x.id === id) || null; }
@@ -173,6 +177,19 @@ async function ensureSchema(env) {
     await runDB(env, `CREATE TABLE IF NOT EXISTS dispatch_templates (
       id TEXT PRIMARY KEY, title TEXT, game_category TEXT, price REAL DEFAULT 0, quantity INTEGER DEFAULT 1,
       urgency TEXT DEFAULT '普通', detail TEXT, remark TEXT, contact TEXT, created_at TEXT)`);
+    await runDB(env, `CREATE TABLE IF NOT EXISTS shops (
+      id TEXT PRIMARY KEY, name TEXT, owner_id TEXT, description TEXT, status TEXT DEFAULT 'active', avatar TEXT, created_at TEXT)`);
+    await runDB(env, `CREATE TABLE IF NOT EXISTS posts (
+      id TEXT PRIMARY KEY, user_id TEXT, username TEXT, content TEXT, images TEXT, category_id TEXT, likes INTEGER DEFAULT 0, created_at TEXT)`);
+    await runDB(env, `CREATE TABLE IF NOT EXISTS post_categories (id TEXT PRIMARY KEY, name TEXT, sort_order INTEGER DEFAULT 0)`);
+    await runDB(env, `CREATE TABLE IF NOT EXISTS gifts (id TEXT PRIMARY KEY, name TEXT, price REAL DEFAULT 0, image TEXT, enabled INTEGER DEFAULT 1)`);
+    await runDB(env, `CREATE TABLE IF NOT EXISTS stickers (id TEXT PRIMARY KEY, name TEXT, url TEXT, is_public INTEGER DEFAULT 1, created_at TEXT)`);
+    await runDB(env, `CREATE TABLE IF NOT EXISTS recharges (id TEXT PRIMARY KEY, user_id TEXT, amount REAL, status TEXT DEFAULT 'pending', created_at TEXT)`);
+    await runDB(env, `CREATE TABLE IF NOT EXISTS withdrawals (id TEXT PRIMARY KEY, user_id TEXT, amount REAL, status TEXT DEFAULT 'pending', created_at TEXT)`);
+    await runDB(env, `CREATE TABLE IF NOT EXISTS icons (id TEXT PRIMARY KEY, key_name TEXT, url TEXT)`);
+    await runDB(env, `CREATE TABLE IF NOT EXISTS exchange_rules (id TEXT PRIMARY KEY, name TEXT, cost INTEGER DEFAULT 0, reward TEXT)`);
+    await runDB(env, `CREATE TABLE IF NOT EXISTS checkin_rewards (id TEXT PRIMARY KEY, day_index INTEGER, reward TEXT, amount REAL DEFAULT 10)`);
+    await runDB(env, `CREATE TABLE IF NOT EXISTS hall_categories (id TEXT PRIMARY KEY, name TEXT, sort_order INTEGER DEFAULT 0)`);
     try { await runDB(env, 'ALTER TABLE products ADD COLUMN stock INTEGER DEFAULT 0'); } catch (_) {}
     try { await runDB(env, 'ALTER TABLE products ADD COLUMN detail TEXT'); } catch (_) {}
     try { await runDB(env, 'ALTER TABLE side_categories ADD COLUMN image TEXT'); } catch (_) {}
@@ -245,7 +262,7 @@ export async function onRequest(context) {
     if (path === '/api/register' && method === 'POST') {
       const username = (body.username || '').trim();
       const password = body.password || '';
-      const allowed = ['boss', 'handler', 'dispatcher', 'cs'];
+      const allowed = ['boss', 'handler', 'dispatcher', 'cs', 'service'];
       let role = body.role || 'boss';
       if (!allowed.includes(role)) role = 'boss';
       if (!username || !password) return errorResponse('请填写用户名和密码');
@@ -667,6 +684,152 @@ export async function onRequest(context) {
       } else memInsert('dispatch_templates', row);
       return jsonResponse({ success: true, id });
     }
+
+
+    // ===== index.html 路径兼容 =====
+    if (path === '/api/announce' && method === 'GET') {
+      if (hasDB(env)) { const a = await queryDB(env, 'SELECT * FROM announcements WHERE enabled=1 ORDER BY sort_order'); return jsonResponse(a.results || []); }
+      return jsonResponse(memAll('announcements', r => r.enabled));
+    }
+    if (path === '/api/categories' && method === 'GET') {
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM side_categories WHERE enabled=1 ORDER BY sort_order'); return jsonResponse(r.results || []); }
+      return jsonResponse(memAll('side_categories', r => r.enabled));
+    }
+    if (path === '/api/banners' && method === 'GET') {
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM banners WHERE enabled=1 ORDER BY sort_order'); return jsonResponse(r.results || []); }
+      return jsonResponse(memAll('banners', r => r.enabled));
+    }
+    if (path === '/api/icons' && method === 'GET') {
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM icons'); return jsonResponse(r.results || []); }
+      return jsonResponse(MEM.icons || []);
+    }
+    if (path === '/api/shops' && method === 'GET') {
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM shops ORDER BY created_at DESC'); return jsonResponse(r.results || []); }
+      return jsonResponse(MEM.shops || []);
+    }
+    if (path.startsWith('/api/shops/') && method === 'GET') {
+      const parts = path.replace('/api/shops/', '').split('/');
+      const shopId = decodeURIComponent(parts[0] || '');
+      if (parts[1] === 'products') {
+        if (hasDB(env)) { const r = await queryDB(env, "SELECT * FROM products WHERE status='on' LIMIT 50"); return jsonResponse(r.results || []); }
+        return jsonResponse(memAll('products', r => r.status === 'on'));
+      }
+      if (parts[1] === 'categories' || parts[1] === 'handlers' || parts[1] === 'reviews') return jsonResponse([]);
+      if (hasDB(env)) {
+        const r = await queryDB(env, 'SELECT * FROM shops WHERE id=?', [shopId]);
+        const shop = r.results && r.results[0];
+        if (!shop) return errorResponse('店铺不存在', 404);
+        return jsonResponse(shop);
+      }
+      const shop = memGet('shops', shopId);
+      if (!shop) return errorResponse('店铺不存在', 404);
+      return jsonResponse(shop);
+    }
+    if (path === '/api/posts' && method === 'GET') {
+      const userId = url.searchParams.get('user_id') || '';
+      if (hasDB(env)) {
+        let sql = 'SELECT * FROM posts', params = [];
+        if (userId) { sql += ' WHERE user_id=?'; params.push(userId); }
+        sql += ' ORDER BY created_at DESC LIMIT 100';
+        const r = await queryDB(env, sql, params);
+        return jsonResponse(r.results || []);
+      }
+      let rows = MEM.posts || [];
+      if (userId) rows = rows.filter(p => p.user_id === userId);
+      return jsonResponse([...rows].reverse());
+    }
+    if (path === '/api/posts' && method === 'POST') {
+      const uid = verifyUserId(auth);
+      if (!uid) return errorResponse('请先登录', 401);
+      const u = await getUserById(env, uid);
+      const id = generateId(), now = new Date().toISOString();
+      const row = { id, user_id: uid, username: u ? u.username : '', content: body.content || '', images: JSON.stringify(body.images || []), category_id: body.category_id || '', likes: 0, created_at: now };
+      if (hasDB(env)) await runDB(env, 'INSERT INTO posts (id,user_id,username,content,images,category_id,likes,created_at) VALUES (?,?,?,?,?,?,?,?)', [id, uid, row.username, row.content, row.images, row.category_id, 0, now]);
+      else memInsert('posts', row);
+      return jsonResponse({ success: true, id });
+    }
+    if (path === '/api/post-categories' && method === 'GET') {
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM post_categories ORDER BY sort_order'); return jsonResponse(r.results || []); }
+      return jsonResponse(MEM.post_categories || []);
+    }
+    if (path === '/api/gifts' && method === 'GET') {
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM gifts WHERE enabled=1'); return jsonResponse(r.results || []); }
+      return jsonResponse((MEM.gifts || []).filter(g => g.enabled !== 0));
+    }
+    if (path === '/api/stickers' && method === 'GET') {
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM stickers WHERE is_public=1'); return jsonResponse(r.results || []); }
+      return jsonResponse((MEM.stickers || []).filter(x => x.is_public));
+    }
+    if (path === '/api/handlers' && method === 'GET') {
+      if (hasDB(env)) { const r = await queryDB(env, "SELECT id,username,avatar,diamond,role FROM users WHERE role='handler'"); return jsonResponse(r.results || []); }
+      return jsonResponse(memAll('users', u => u.role === 'handler').map(publicUser));
+    }
+    if (path === '/api/heartbeat' && method === 'GET') return jsonResponse({ ok: true, t: Date.now() });
+    if (path === '/api/theme' && method === 'GET') return jsonResponse(MEM.theme || { preset: 'default' });
+    if (path === '/api/ai/settings' && method === 'GET') return jsonResponse(MEM.ai_settings || {});
+    if (path === '/api/exchange/rules' && method === 'GET') {
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM exchange_rules'); return jsonResponse(r.results || []); }
+      return jsonResponse(MEM.exchange_rules || []);
+    }
+    if (path === '/api/admin/recharges' && method === 'GET') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM recharges ORDER BY created_at DESC'); return jsonResponse(r.results || []); }
+      return jsonResponse(MEM.recharges || []);
+    }
+    if (path === '/api/admin/withdrawals' && method === 'GET') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM withdrawals ORDER BY created_at DESC'); return jsonResponse(r.results || []); }
+      return jsonResponse(MEM.withdrawals || []);
+    }
+    if (path === '/api/admin/announce' && method === 'GET') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM announcements ORDER BY sort_order'); return jsonResponse(r.results || []); }
+      return jsonResponse(MEM.announcements || []);
+    }
+    if (path === '/api/admin/checkin-rewards' && method === 'GET') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM checkin_rewards ORDER BY day_index'); return jsonResponse(r.results || []); }
+      return jsonResponse(MEM.checkin_rewards || []);
+    }
+    if (path === '/api/admin/gifts' && method === 'GET') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM gifts'); return jsonResponse(r.results || []); }
+      return jsonResponse(MEM.gifts || []);
+    }
+    if (path === '/api/admin/stickers' && method === 'GET') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM stickers'); return jsonResponse(r.results || []); }
+      return jsonResponse(MEM.stickers || []);
+    }
+    if (path === '/api/admin/db/tables' && method === 'GET') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      return jsonResponse(['users','products','orders','messages','shops','posts','dispatch_orders','banners','announcements']);
+    }
+    if (path === '/api/admin/b2/list' && method === 'GET') {
+      if (!(await requireAdmin(env, auth))) return errorResponse('权限不足', 403);
+      return jsonResponse([]);
+    }
+    if (path === '/api/dispatcher/orders' && method === 'GET') {
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM dispatch_orders ORDER BY created_at DESC LIMIT 100'); return jsonResponse(r.results || []); }
+      return jsonResponse([...(MEM.dispatch_orders || [])].reverse());
+    }
+    if (path === '/api/hall/categories' && method === 'GET') {
+      if (hasDB(env)) { const r = await queryDB(env, 'SELECT * FROM hall_categories ORDER BY sort_order'); return jsonResponse(r.results || []); }
+      return jsonResponse(MEM.hall_categories || []);
+    }
+    if (path === '/api/recharge-images' && method === 'GET') return jsonResponse([]);
+    if (path === '/api/messages/unread' && method === 'GET') {
+      const uid = verifyUserId(auth);
+      if (!uid) return jsonResponse({ count: 0 });
+      if (hasDB(env)) {
+        const r = await queryDB(env, 'SELECT COUNT(*) as c FROM messages WHERE receiver_id=?', [uid]);
+        const c = Number((r.results && r.results[0] && r.results[0].c) || 0);
+        return jsonResponse({ count: Math.min(c, 99) });
+      }
+      const c = (MEM.messages || []).filter(m => m.receiver_id === uid).length;
+      return jsonResponse({ count: Math.min(c, 99) });
+    }
+
 
     return errorResponse('接口不存在: ' + path, 404);
   } catch (e) {
